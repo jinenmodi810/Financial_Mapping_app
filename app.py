@@ -68,7 +68,7 @@ def list_local_companies():
     Scans /data/raw/Companies_urgent/ for JSONs and returns:
     {display_name: full_path}
     """
-    base_path = "/Users/jinenmodi/ImpData/financial_term_mapper/financial_term_mapper/data/raw/Companies_urgent"
+    base_path = base_path = os.path.join("data", "raw", "Companies_urgent")
     if not os.path.exists(base_path):
         st.error(f"❌ Directory not found: {base_path}")
         return {}
