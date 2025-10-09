@@ -1,0 +1,17 @@
+{
+    "CINF": {"name": "Cincinnati Financial", "cik": "0000020286"},
+    "FICO": {"name": "Fair Isaac", "cik": "0000814547"},
+    "FI": {"name": "Fiserv", "cik": "0000798354"},
+    "GS": {"name": "Goldman Sachs", "cik": "0000886982"},
+    "HWM": {"name": "Howmet Aerospace", "cik": "0000004281"},
+    "IRM": {"name": "Iron Mountain", "cik": "0001020569"},
+    "KMI": {"name": "Kinder Morgan", "cik": "0001506307"},
+    "KKR": {"name": "KKR & Co.", "cik": "0001404912"},
+    "NRG": {"name": "NRG Energy", "cik": "0001013871"},
+    "NVDA": {"name": "Nvidia", "cik": "0001045810"},
+    "OKE": {"name": "Oneok", "cik": "0001039684"},
+    "SYF": {"name": "Synchrony Financial", "cik": "0001601712"},
+    "VST": {"name": "Vistra Corp.", "cik": "0001692819"},
+    "WAB": {"name": "Wabtec", "cik": "0000943452"},
+    "WMT": {"name": "Walmart", "cik": "0000104169"}
+  }
