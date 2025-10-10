@@ -292,3 +292,30 @@ if company_data:
 
 else:
     st.info("Please select a company or upload a JSON file to begin.")
+
+import io
+import sqlite3
+import pandas as pd
+
+if os.path.exists(DB_PATH):
+    # Create an in-memory copy for download
+    with open(DB_PATH, "rb") as f:
+        db_bytes = f.read()
+
+    st.download_button(
+        label="⬇️ Download Database File",
+        data=db_bytes,
+        file_name="company_mappings.db",
+        mime="application/x-sqlite3"
+    )
+
+    # Optional preview
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = pd.read_sql_query("SELECT COUNT(*) as count FROM term_mappings", conn)["count"][0]
+        st.write(f"💾 Database currently has {rows} records.")
+        conn.close()
+    except Exception as e:
+        st.warning(f"Could not read database: {e}")
+else:
+    st.warning("⚠️ Database file not found.")
