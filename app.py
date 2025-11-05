@@ -1,8 +1,8 @@
 import os
 import json
-import sqlite3
 import pandas as pd
 import streamlit as st
+import mysql.connector  # ✅ Using MySQL instead of sqlite3
 
 from utils.xbrl_statement_parser import build_statement_table
 from utils.db_handler import init_db, get_all_library_terms
@@ -21,7 +21,19 @@ except Exception:
     get_company_progress_summary = None
     get_progress_for_company = None
 
-DB_PATH = "data/mappings/company_mappings.db"
+# ✅ MySQL connection helper
+def get_connection():
+    return mysql.connector.connect(
+        host="fintasenseai.mysql.database.azure.com",
+        user="ayoub",
+        password="Password@2025",
+        database="fsfinancialmapper",
+        port=3306,
+        ssl_ca="/Users/jinenmodi/Downloads/DigiCertGlobalRootCA.crt.pem",
+        ssl_disabled=False,
+        autocommit=True  # ✅ prevents hanging transactions
+        
+    )
 
 st.set_page_config(page_title="Financial Term Mapper", layout="wide")
 
@@ -59,62 +71,69 @@ def inject_mobile_styles():
     """, unsafe_allow_html=True)
 
 inject_mobile_styles()
-init_db()
 
 st.title("Financial Term Mapper")
 st.caption("Extract SEC line items, view GAAP tags and descriptions, and map them to your own library.")
 
 # ---------- Helpers ----------
-def _db_has_statement_type(conn: sqlite3.Connection) -> bool:
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(term_mappings)")
-    cols = [r[1] for r in cur.fetchall()]
-    return "statement_type" in cols
-
 def fetch_saved_map(cik: str, statement_type: str) -> dict:
-    """
-    Return dict {us_gaap_tag: library_term} for this cik and statement_type.
-    Works whether DB has statement_type or not.
-    """
-    if not os.path.exists(DB_PATH):
-        return {}
-    conn = sqlite3.connect(DB_PATH)
+    """Return dict {us_gaap_tag: library_term} for this cik and statement_type."""
+    conn = get_connection()
     try:
-        has_stype = _db_has_statement_type(conn)
         cur = conn.cursor()
-        if has_stype:
-            cur.execute("""
-                SELECT us_gaap_tag, library_term
-                FROM term_mappings
-                WHERE cik = ? AND statement_type = ? AND library_term IS NOT NULL AND TRIM(library_term) != ''
-            """, (cik, statement_type))
-        else:
-            cur.execute("""
-                SELECT us_gaap_tag, library_term
-                FROM term_mappings
-                WHERE cik = ? AND library_term IS NOT NULL AND TRIM(library_term) != ''
-            """, (cik,))
+        cur.execute("""
+            SELECT us_gaap_tag, library_term
+            FROM term_mappings
+            WHERE cik = %s AND statement_type = %s
+              AND library_term IS NOT NULL AND TRIM(library_term) != ''
+        """, (cik, statement_type))
         rows = cur.fetchall()
-        return {tag: lib for tag, lib in rows if str(tag or "").strip() != ""}
+        # ✅ Normalize keys for robust matching
+        return {str(tag).strip().lower(): str(lib).strip() for tag, lib in rows if str(tag or "").strip() != ""}
     finally:
         conn.close()
 
+
 def upsert_mappings(cik: str, company_name: str, statement_type: str, mappings: list[tuple[str, str]]):
-    """
-    Save mappings with best available method.
-    """
-    if HAVE_TYPED_SAVE:
-        save_mappings_with_type(cik, company_name, statement_type, mappings)
-    else:
-        # Fallback schema without statement_type
-        from utils.db_handler import save_mappings
-        save_mappings(cik, company_name, mappings)
+    """Insert, update, or delete mappings based on user edits."""
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        for tag, lib in mappings:
+            tag_norm = str(tag).strip()
+            lib_clean = str(lib).strip().lower()
+
+            if tag_norm == "":
+                continue  # skip invalid tags
+
+            # ✅ Delete if Library Term is blank or cleared
+            if lib_clean in ("", "none", "nan"):
+                cur.execute("""
+                    DELETE FROM term_mappings
+                    WHERE cik = %s AND statement_type = %s AND us_gaap_tag = %s
+                """, (cik, statement_type, tag_norm))
+                continue
+
+            # ✅ Otherwise, insert or update
+            cur.execute("""
+                INSERT INTO term_mappings (cik, company_name, statement_type, us_gaap_tag, library_term)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE library_term = VALUES(library_term)
+            """, (cik, company_name, statement_type, tag_norm, lib))
+        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[ERROR] upsert_mappings failed: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
 
 @st.cache_data
 def list_local_companies():
-    """
-    Load JSONs from data/raw/Companies_urgent and return {display: path}
-    """
+    """Load JSONs from data/raw/Companies_urgent and return {display: path}"""
     base_path = os.path.join("data", "raw", "Companies_urgent")
     companies = {}
     if not os.path.exists(base_path):
@@ -133,17 +152,30 @@ def list_local_companies():
                 print(f"[WARN] Skipping {file}: {e}")
     return companies
 
+
 def load_company_json(file_path: str):
     if os.path.exists(file_path):
         with open(file_path, "r") as f:
             return json.load(f)
     return None
 
+
 # ---------- Progress dashboard ----------
 st.subheader("Company Mapping Progress Overview")
-if get_company_progress_summary is not None:
-    summary = get_company_progress_summary()
-    if summary:
+try:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT company_name, cik, statement_type, COUNT(DISTINCT us_gaap_tag)
+        FROM term_mappings
+        GROUP BY company_name, cik, statement_type
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    if rows:
+        summary = {}
+        for name, cik, stype, count in rows:
+            summary.setdefault((name, cik), {})[stype] = count
         for (name, cik), stats in summary.items():
             total = sum(stats.values())
             st.markdown(f"""
@@ -158,8 +190,9 @@ if get_company_progress_summary is not None:
             """, unsafe_allow_html=True)
     else:
         st.info("No mappings saved yet. Start mapping to see progress here.")
-else:
-    st.info("Progress dashboard unavailable with the current database module.")
+except Exception as e:
+    st.warning(f"Could not load dashboard: {e}")
+
 st.divider()
 
 # ---------- Company selection ----------
@@ -185,13 +218,22 @@ if company_data:
 
     st.success(f"Loaded company: {company_name} (CIK: {cik})")
 
-    if get_progress_for_company is not None:
-        comp_progress = get_progress_for_company(cik)
-        cols = st.columns(4)
-        for i, stmt in enumerate(["income", "balance", "cashflow", "equity"]):
-            with cols[i]:
-                st.metric(stmt.title(), comp_progress.get(stmt, 0))
-        st.divider()
+    # --- Progress per company ---
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT statement_type, COUNT(DISTINCT us_gaap_tag)
+        FROM term_mappings WHERE cik = %s GROUP BY statement_type
+    """, (cik,))
+    rows = cur.fetchall()
+    conn.close()
+    comp_progress = {stype: count for stype, count in rows}
+
+    cols = st.columns(4)
+    for i, stmt in enumerate(["income", "balance", "cashflow", "equity"]):
+        with cols[i]:
+            st.metric(stmt.title(), comp_progress.get(stmt, 0))
+    st.divider()
 
     statement_choice = st.selectbox(
         "Select Statement Type:",
@@ -204,26 +246,40 @@ if company_data:
     if session_key not in st.session_state:
         with st.spinner("Parsing SEC filing..."):
             df = build_statement_table(cik, company_data, statement_type=statement_choice)
-
         if df is None or df.empty:
             st.error("Could not extract statement data.")
             st.stop()
-
         if "Library Term" not in df.columns:
             df["Library Term"] = ""
-
-        # Prefill from DB
         saved_map = fetch_saved_map(cik, statement_type=statement_choice)
+
+        # ✅ Normalize both DF and saved map before matching
+        df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
         if saved_map:
             df["Library Term"] = df["us-gaap Tag"].map(saved_map).fillna(df["Library Term"])
             st.info(f"Loaded {len(saved_map)} previously saved mappings for this statement.")
-
         st.session_state[session_key] = df.copy()
 
     working_df = st.session_state[session_key].copy()
+    working_df = working_df.fillna("")  # ✅ remove all NaN before showing in UI
 
-    # 🔹 New: provide a helper dropdown per row without killing free-typing
-    # We add a parallel "Pick (optional)" column with your existing terms.
+    # ✅ Ensure Pick column exists before reordering
+    if "Pick (optional)" not in working_df.columns:
+        working_df["Pick (optional)"] = ""
+
+    # ✅ Reorder columns for preferred layout
+    desired_order = []
+    for col in ["SEC Line Item", "us-gaap Tag", "Library Term", "Pick (optional)", "Description"]:
+        if col in working_df.columns:
+            desired_order.append(col)
+
+    # Include any remaining columns (just in case)
+    for col in working_df.columns:
+        if col not in desired_order:
+            desired_order.append(col)
+
+    working_df = working_df[desired_order]
+
     existing_terms = get_all_library_terms()
     if "Pick (optional)" not in working_df.columns:
         working_df["Pick (optional)"] = ""
@@ -234,13 +290,11 @@ if company_data:
         width="stretch",
         num_rows="dynamic",
         column_config={
-            # Keep Library Term fully editable
             "Library Term": st.column_config.TextColumn(
                 "Library Term",
                 help="Type a term freely. Or use the dropdown in 'Pick (optional)' to fill this cell.",
                 max_chars=150
             ),
-            # Add dropdown suggestions that can copy into Library Term
             "Pick (optional)": st.column_config.SelectboxColumn(
                 "Pick (optional)",
                 help="Optional helper: pick from saved terms to fill 'Library Term'.",
@@ -250,72 +304,40 @@ if company_data:
         }
     )
 
-    # Apply any picks into Library Term (so users can mix typing + picking)
     df_to_keep = edited_df.copy()
     if "Pick (optional)" in df_to_keep.columns:
         pick_mask = df_to_keep["Pick (optional)"].fillna("").astype(str).str.strip() != ""
         df_to_keep.loc[pick_mask, "Library Term"] = df_to_keep.loc[pick_mask, "Pick (optional)"]
-        # Drop the helper column from what we persist/save (UI will re-add next render)
         df_to_keep = df_to_keep.drop(columns=["Pick (optional)"], errors="ignore")
 
-    # Persist the user's latest edits across reruns
     st.session_state[session_key] = df_to_keep.copy()
 
     col_save, col_reset = st.columns([1, 1])
     with col_save:
+        # ✅ Modified to send all rows (including blanks) to backend
         if st.button("Save mappings to database"):
             mappings = [
                 (row["us-gaap Tag"], str(row["Library Term"]).strip())
                 for _, row in df_to_keep.iterrows()
-                if str(row["Library Term"]).strip() != ""
             ]
             if mappings:
                 upsert_mappings(cik, company_name, statement_choice, mappings)
-                st.success(f"Saved {len(mappings)} mappings for {company_name} ({statement_choice}).")
+                st.success(f"Synced {len(mappings)} mappings for {company_name} ({statement_choice}).")
+                st.rerun()  # ✅ Auto-refresh metrics and dashboard
             else:
-                st.warning("No library terms entered yet.")
+                st.warning("No mappings to process.")
 
     with col_reset:
         if st.button("Reset unsaved edits in table"):
-            # Reload from DB + rebuild table from source
             with st.spinner("Resetting view..."):
                 df = build_statement_table(cik, company_data, statement_type=statement_choice)
                 if "Library Term" not in df.columns:
                     df["Library Term"] = ""
                 saved_map = fetch_saved_map(cik, statement_choice)
                 if saved_map:
+                    df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
                     df["Library Term"] = df["us-gaap Tag"].map(saved_map).fillna(df["Library Term"])
                 st.session_state[session_key] = df.copy()
             st.rerun()
-
-    st.caption(f"Database path: {os.path.abspath(DB_PATH)}")
-
 else:
     st.info("Please select a company or upload a JSON file to begin.")
-
-import io
-import sqlite3
-import pandas as pd
-
-if os.path.exists(DB_PATH):
-    # Create an in-memory copy for download
-    with open(DB_PATH, "rb") as f:
-        db_bytes = f.read()
-
-    st.download_button(
-        label="⬇️ Download Database File",
-        data=db_bytes,
-        file_name="company_mappings.db",
-        mime="application/x-sqlite3"
-    )
-
-    # Optional preview
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        rows = pd.read_sql_query("SELECT COUNT(*) as count FROM term_mappings", conn)["count"][0]
-        st.write(f"💾 Database currently has {rows} records.")
-        conn.close()
-    except Exception as e:
-        st.warning(f"Could not read database: {e}")
-else:
-    st.warning("⚠️ Database file not found.")
