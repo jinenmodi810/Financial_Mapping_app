@@ -29,7 +29,6 @@ def get_connection():
         password="Password@2025",
         database="fsfinancialmapper",
         port=3306,
-        ssl_ca="/Users/jinenmodi/Downloads/DigiCertGlobalRootCA.crt.pem",
         ssl_disabled=False,
         autocommit=True  # ✅ prevents hanging transactions
         
