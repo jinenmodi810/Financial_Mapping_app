@@ -2,12 +2,11 @@ import os
 import json
 import pandas as pd
 import streamlit as st
-import mysql.connector  # ✅ Using MySQL instead of sqlite3
+import mysql.connector
 
 from utils.xbrl_statement_parser import build_statement_table
 from utils.db_handler import init_db, get_all_library_terms
 
-# Optional imports if present in your db_handler
 try:
     from utils.db_handler import (
         save_mappings_with_type,
@@ -16,12 +15,12 @@ try:
     )
     HAVE_TYPED_SAVE = True
 except Exception:
-    from utils.db_handler import save_mappings  # fallback
+    from utils.db_handler import save_mappings
     HAVE_TYPED_SAVE = False
     get_company_progress_summary = None
     get_progress_for_company = None
 
-# ✅ MySQL connection helper
+
 def get_connection():
     return mysql.connector.connect(
         host="fintasenseai.mysql.database.azure.com",
@@ -30,10 +29,12 @@ def get_connection():
         database="fsfinancialmapper",
         port=3306,
         ssl_disabled=False,
-        autocommit=True  # ✅ prevents hanging transactions
+        autocommit=True
     )
 
+
 st.set_page_config(page_title="Financial Term Mapper", layout="wide")
+
 
 def inject_mobile_styles():
     st.markdown("""
@@ -68,14 +69,13 @@ def inject_mobile_styles():
     </style>
     """, unsafe_allow_html=True)
 
-inject_mobile_styles()
 
+inject_mobile_styles()
 st.title("Financial Term Mapper")
 st.caption("Extract SEC line items, view GAAP tags and descriptions, and map them to your own library.")
 
-# ---------- Helpers ----------
+
 def fetch_saved_map(cik: str, statement_type: str) -> dict:
-    """Return dict {us_gaap_tag: library_term} for this cik and statement_type."""
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -91,31 +91,43 @@ def fetch_saved_map(cik: str, statement_type: str) -> dict:
         conn.close()
 
 
-def upsert_mappings(cik: str, company_name: str, statement_type: str, mappings: list[tuple[str, str]]):
-    """Insert, update, or delete mappings based on user edits."""
+def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_df, old_df):
+    """Batch update and delete mappings based on full table diff."""
     conn = get_connection()
     cur = conn.cursor()
+
     try:
-        for tag, lib in mappings:
-            tag_norm = str(tag).strip()
-            lib_clean = str(lib).strip().lower()
-            if tag_norm == "":
-                continue
-            if lib_clean in ("", "none", "nan"):
-                cur.execute("""
-                    DELETE FROM term_mappings
-                    WHERE cik = %s AND statement_type = %s AND us_gaap_tag = %s
-                """, (cik, statement_type, tag_norm))
-                continue
+        # Detect deleted tags (were mapped before but now cleared)
+        deleted_tags = []
+        old_map = {r["us-gaap Tag"].strip().lower(): r["Library Term"].strip().lower()
+                   for _, r in old_df.iterrows() if str(r["Library Term"]).strip() != ""}
+        new_map = {r["us-gaap Tag"].strip().lower(): r["Library Term"].strip().lower()
+                   for _, r in new_df.iterrows() if str(r["Library Term"]).strip() != ""}
+
+        for tag in old_map:
+            if tag not in new_map:
+                deleted_tags.append(tag)
+
+        # Apply deletions
+        if deleted_tags:
+            cur.executemany("""
+                DELETE FROM term_mappings
+                WHERE cik = %s AND statement_type = %s AND LOWER(us_gaap_tag) = %s
+            """, [(cik, statement_type, t) for t in deleted_tags])
+
+        # Apply upserts
+        for tag, lib in new_map.items():
             cur.execute("""
                 INSERT INTO term_mappings (cik, company_name, statement_type, us_gaap_tag, library_term)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE library_term = VALUES(library_term)
-            """, (cik, company_name, statement_type, tag_norm, lib))
+            """, (cik, company_name, statement_type, tag, lib))
+
         conn.commit()
+
     except Exception as e:
         conn.rollback()
-        print(f"[ERROR] upsert_mappings failed: {e}")
+        print(f"[ERROR] batch upsert failed: {e}")
     finally:
         cur.close()
         conn.close()
@@ -287,22 +299,18 @@ if company_data:
         df_to_keep.loc[pick_mask, "Library Term"] = df_to_keep.loc[pick_mask, "Pick (optional)"]
         df_to_keep = df_to_keep.drop(columns=["Pick (optional)"], errors="ignore")
 
-    # ✅ FIX: don't overwrite main session state on every rerun
     st.session_state[f"edited_{session_key}"] = df_to_keep.copy()
 
+    message_box = st.empty()
     col_save, col_reset = st.columns([1, 1])
     with col_save:
         if st.button("Save mappings to database"):
             df_final = st.session_state.get(f"edited_{session_key}", df_to_keep)
-            mappings = [
-                (row["us-gaap Tag"], str(row["Library Term"]).strip())
-                for _, row in df_final.iterrows()
-            ]
-            if mappings:
-                upsert_mappings(cik, company_name, statement_choice, mappings)
-                st.success(f"Synced {len(mappings)} mappings for {company_name} ({statement_choice}).")
-            else:
-                st.warning("No mappings to process.")
+            old_df = st.session_state[session_key]
+            upsert_mappings_batch(cik, company_name, statement_choice, df_final, old_df)
+            message_box.success(f"✅ Saved {len(df_final)} mappings successfully for {company_name} ({statement_choice}).")
+            st.session_state[session_key] = df_final.copy()
+            st.rerun()
 
     with col_reset:
         if st.button("Reset unsaved edits in table"):
