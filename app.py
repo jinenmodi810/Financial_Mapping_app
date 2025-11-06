@@ -31,7 +31,6 @@ def get_connection():
         port=3306,
         ssl_disabled=False,
         autocommit=True  # ✅ prevents hanging transactions
-        
     )
 
 st.set_page_config(page_title="Financial Term Mapper", layout="wide")
@@ -87,7 +86,6 @@ def fetch_saved_map(cik: str, statement_type: str) -> dict:
               AND library_term IS NOT NULL AND TRIM(library_term) != ''
         """, (cik, statement_type))
         rows = cur.fetchall()
-        # ✅ Normalize keys for robust matching
         return {str(tag).strip().lower(): str(lib).strip() for tag, lib in rows if str(tag or "").strip() != ""}
     finally:
         conn.close()
@@ -97,30 +95,23 @@ def upsert_mappings(cik: str, company_name: str, statement_type: str, mappings: 
     """Insert, update, or delete mappings based on user edits."""
     conn = get_connection()
     cur = conn.cursor()
-
     try:
         for tag, lib in mappings:
             tag_norm = str(tag).strip()
             lib_clean = str(lib).strip().lower()
-
             if tag_norm == "":
-                continue  # skip invalid tags
-
-            # ✅ Delete if Library Term is blank or cleared
+                continue
             if lib_clean in ("", "none", "nan"):
                 cur.execute("""
                     DELETE FROM term_mappings
                     WHERE cik = %s AND statement_type = %s AND us_gaap_tag = %s
                 """, (cik, statement_type, tag_norm))
                 continue
-
-            # ✅ Otherwise, insert or update
             cur.execute("""
                 INSERT INTO term_mappings (cik, company_name, statement_type, us_gaap_tag, library_term)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE library_term = VALUES(library_term)
             """, (cik, company_name, statement_type, tag_norm, lib))
-        
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -132,7 +123,6 @@ def upsert_mappings(cik: str, company_name: str, statement_type: str, mappings: 
 
 @st.cache_data
 def list_local_companies():
-    """Load JSONs from data/raw/Companies_urgent and return {display: path}"""
     base_path = os.path.join("data", "raw", "Companies_urgent")
     companies = {}
     if not os.path.exists(base_path):
@@ -217,7 +207,6 @@ if company_data:
 
     st.success(f"Loaded company: {company_name} (CIK: {cik})")
 
-    # --- Progress per company ---
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -251,37 +240,26 @@ if company_data:
         if "Library Term" not in df.columns:
             df["Library Term"] = ""
         saved_map = fetch_saved_map(cik, statement_type=statement_choice)
-
-        # ✅ Normalize both DF and saved map before matching
         df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
         if saved_map:
             df["Library Term"] = df["us-gaap Tag"].map(saved_map).fillna(df["Library Term"])
             st.info(f"Loaded {len(saved_map)} previously saved mappings for this statement.")
         st.session_state[session_key] = df.copy()
 
-    working_df = st.session_state[session_key].copy()
-    working_df = working_df.fillna("")  # ✅ remove all NaN before showing in UI
-
-    # ✅ Ensure Pick column exists before reordering
+    working_df = st.session_state[session_key].copy().fillna("")
     if "Pick (optional)" not in working_df.columns:
         working_df["Pick (optional)"] = ""
 
-    # ✅ Reorder columns for preferred layout
     desired_order = []
     for col in ["SEC Line Item", "us-gaap Tag", "Library Term", "Pick (optional)", "Description"]:
         if col in working_df.columns:
             desired_order.append(col)
-
-    # Include any remaining columns (just in case)
     for col in working_df.columns:
         if col not in desired_order:
             desired_order.append(col)
-
     working_df = working_df[desired_order]
 
     existing_terms = get_all_library_terms()
-    if "Pick (optional)" not in working_df.columns:
-        working_df["Pick (optional)"] = ""
 
     edited_df = st.data_editor(
         working_df,
@@ -309,20 +287,20 @@ if company_data:
         df_to_keep.loc[pick_mask, "Library Term"] = df_to_keep.loc[pick_mask, "Pick (optional)"]
         df_to_keep = df_to_keep.drop(columns=["Pick (optional)"], errors="ignore")
 
-    st.session_state[session_key] = df_to_keep.copy()
+    # ✅ FIX: don't overwrite main session state on every rerun
+    st.session_state[f"edited_{session_key}"] = df_to_keep.copy()
 
     col_save, col_reset = st.columns([1, 1])
     with col_save:
-        # ✅ Modified to send all rows (including blanks) to backend
         if st.button("Save mappings to database"):
+            df_final = st.session_state.get(f"edited_{session_key}", df_to_keep)
             mappings = [
                 (row["us-gaap Tag"], str(row["Library Term"]).strip())
-                for _, row in df_to_keep.iterrows()
+                for _, row in df_final.iterrows()
             ]
             if mappings:
                 upsert_mappings(cik, company_name, statement_choice, mappings)
                 st.success(f"Synced {len(mappings)} mappings for {company_name} ({statement_choice}).")
-                st.rerun()  # ✅ Auto-refresh metrics and dashboard
             else:
                 st.warning("No mappings to process.")
 
