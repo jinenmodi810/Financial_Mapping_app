@@ -6,6 +6,7 @@ import mysql.connector
 
 from utils.xbrl_statement_parser import build_statement_table
 from utils.db_handler import init_db, get_all_library_terms
+from utils.json_exporter import export_mappings_to_json
 
 try:
     from utils.db_handler import (
@@ -76,6 +77,11 @@ st.caption("Extract SEC line items, view GAAP tags and descriptions, and map the
 
 
 def fetch_saved_map(cik: str, statement_type: str) -> dict:
+    """
+    Fetch saved mappings for a given company and statement type.
+    Keep both 'us_gaap_tag' and 'library_term' exactly as stored in DB.
+    Only normalize tags temporarily for matching; preserve original text fully.
+    """
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -86,7 +92,14 @@ def fetch_saved_map(cik: str, statement_type: str) -> dict:
               AND library_term IS NOT NULL AND TRIM(library_term) != ''
         """, (cik, statement_type))
         rows = cur.fetchall()
-        return {str(tag).strip().lower(): str(lib).strip() for tag, lib in rows if str(tag or "").strip() != ""}
+
+        mapping = {}
+        for tag, lib in rows:
+            if not tag:
+                continue
+            tag_norm = str(tag).strip().lower()  # temporary lowercase key for matching
+            mapping[tag_norm] = str(lib).strip()
+        return mapping
     finally:
         conn.close()
 
@@ -96,35 +109,46 @@ def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_
     conn = get_connection()
     cur = conn.cursor()
 
+    def normalize_tag(tag: str) -> str:
+        tag = str(tag).strip()
+        if not tag:
+            return ""
+        return tag
+
     try:
-        # Detect deleted tags (were mapped before but now cleared)
-        deleted_tags = []
-        old_map = {r["us-gaap Tag"].strip().lower(): r["Library Term"].strip().lower()
-                   for _, r in old_df.iterrows() if str(r["Library Term"]).strip() != ""}
-        new_map = {r["us-gaap Tag"].strip().lower(): r["Library Term"].strip().lower()
-                   for _, r in new_df.iterrows() if str(r["Library Term"]).strip() != ""}
+        old_map = {
+            normalize_tag(r["us-gaap Tag"]): str(r["Library Term"]).strip()
+            for _, r in old_df.iterrows()
+            if str(r["Library Term"]).strip() != ""
+        }
+        new_map = {
+            normalize_tag(r["us-gaap Tag"]): str(r["Library Term"]).strip()
+            for _, r in new_df.iterrows()
+            if str(r["Library Term"]).strip() != ""
+        }
 
-        for tag in old_map:
-            if tag not in new_map:
-                deleted_tags.append(tag)
+        deleted_tags = [t for t in old_map if t not in new_map]
 
-        # Apply deletions
         if deleted_tags:
-            cur.executemany("""
+            cur.executemany(
+                """
                 DELETE FROM term_mappings
-                WHERE cik = %s AND statement_type = %s AND LOWER(us_gaap_tag) = %s
-            """, [(cik, statement_type, t) for t in deleted_tags])
+                WHERE cik = %s AND statement_type = %s AND us_gaap_tag = %s
+                """,
+                [(cik, statement_type, t) for t in deleted_tags],
+            )
 
-        # Apply upserts
         for tag, lib in new_map.items():
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO term_mappings (cik, company_name, statement_type, us_gaap_tag, library_term)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE library_term = VALUES(library_term)
-            """, (cik, company_name, statement_type, tag, lib))
+                """,
+                (cik, company_name, statement_type, tag, lib),
+            )
 
         conn.commit()
-
     except Exception as e:
         conn.rollback()
         print(f"[ERROR] batch upsert failed: {e}")
@@ -252,9 +276,11 @@ if company_data:
         if "Library Term" not in df.columns:
             df["Library Term"] = ""
         saved_map = fetch_saved_map(cik, statement_type=statement_choice)
-        df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
+        df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip()
         if saved_map:
-            df["Library Term"] = df["us-gaap Tag"].map(saved_map).fillna(df["Library Term"])
+            df["_key"] = df["us-gaap Tag"].str.lower()
+            df["Library Term"] = df["_key"].map(saved_map).fillna(df["Library Term"])
+            df = df.drop(columns=["_key"], errors="ignore")
             st.info(f"Loaded {len(saved_map)} previously saved mappings for this statement.")
         st.session_state[session_key] = df.copy()
 
@@ -320,9 +346,23 @@ if company_data:
                     df["Library Term"] = ""
                 saved_map = fetch_saved_map(cik, statement_choice)
                 if saved_map:
-                    df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
-                    df["Library Term"] = df["us-gaap Tag"].map(saved_map).fillna(df["Library Term"])
+                    df["_key"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
+                    df["Library Term"] = df["_key"].map(saved_map).fillna(df["Library Term"])
+                    df = df.drop(columns=["_key"], errors="ignore")
                 st.session_state[session_key] = df.copy()
             st.rerun()
 else:
     st.info("Please select a company or upload a JSON file to begin.")
+
+st.divider()
+st.subheader("Export Company Mappings to JSON")
+
+if company_data:
+    if st.button("Download JSON Mappings"):
+        json_data = export_mappings_to_json(cik)
+        st.download_button(
+            label="Click here to download JSON file",
+            data=json_data,
+            file_name=f"{company_name.replace(' ', '_')}_mappings.json",
+            mime="application/json"
+        )
