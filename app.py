@@ -103,6 +103,31 @@ def fetch_saved_map(cik: str, statement_type: str) -> dict:
     finally:
         conn.close()
 
+def fetch_global_mappings() -> dict:
+    """
+    Fetch us_gaap_tag -> library_term for ALL companies.
+    Used to auto-fill library terms for any company
+    that shares the same us-gaap tag.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT us_gaap_tag, library_term
+            FROM term_mappings
+            WHERE library_term IS NOT NULL
+              AND TRIM(library_term) != ''
+        """)
+        rows = cur.fetchall()
+
+        global_map = {}
+        for tag, lib in rows:
+            if not tag:
+                continue
+            global_map[str(tag).strip()] = str(lib).strip()
+        return global_map
+    finally:
+        conn.close()
 
 def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_df, old_df):
     """Batch update and delete mappings based on full table diff."""
@@ -276,6 +301,23 @@ if company_data:
         if "Library Term" not in df.columns:
             df["Library Term"] = ""
         saved_map = fetch_saved_map(cik, statement_type=statement_choice)
+        # Load global mappings for all companies
+        global_map = fetch_global_mappings()
+
+        # Temporary normalized key column
+        df["_key"] = df["us-gaap Tag"].astype(str).str.strip()
+
+        # Apply global mapping only where library term is still empty
+        df["Library Term"] = df.apply(
+            lambda row: (
+                saved_map.get(row["_key"].lower(), "") or
+                global_map.get(row["_key"], "") or
+                row["Library Term"]
+        ),
+            axis=1
+        )
+
+        df = df.drop(columns=["_key"], errors="ignore")
         df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip()
         if saved_map:
             df["_key"] = df["us-gaap Tag"].str.lower()
@@ -345,6 +387,19 @@ if company_data:
                 if "Library Term" not in df.columns:
                     df["Library Term"] = ""
                 saved_map = fetch_saved_map(cik, statement_choice)
+                
+                global_map = fetch_global_mappings()
+
+                df["_key"] = df["us-gaap Tag"].astype(str).str.strip()
+                df["Library Term"] = df.apply(
+                lambda row: (
+                    saved_map.get(row["_key"].lower(), "") or
+                    global_map.get(row["_key"], "") or
+                    row["Library Term"]
+                ),
+                    axis=1
+                )
+                df = df.drop(columns=["_key"], errors="ignore")
                 if saved_map:
                     df["_key"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
                     df["Library Term"] = df["_key"].map(saved_map).fillna(df["Library Term"])
