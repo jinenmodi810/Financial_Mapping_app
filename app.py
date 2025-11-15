@@ -129,6 +129,42 @@ def fetch_global_mappings() -> dict:
     finally:
         conn.close()
 
+def mark_company_completed(cik, name, industry):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO completed_companies (cik, company_name, industry)
+        VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE completed_at = CURRENT_TIMESTAMP
+    """, (cik, name, industry))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_completed_companies():
+    """
+    Return a set of CIKs that are already marked as completed.
+    If the completed_companies table does not exist yet,
+    return an empty set so the app still runs.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT cik FROM completed_companies")
+            rows = cur.fetchall()
+            return {str(r[0]) for r in rows}
+        except mysql.connector.errors.ProgrammingError as e:
+            # 1146 = table does not exist
+            if getattr(e, "errno", None) == 1146:
+                return set()
+            raise
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
 def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_df, old_df):
     """Batch update and delete mappings based on full table diff."""
     conn = get_connection()
@@ -201,7 +237,32 @@ def list_local_companies():
             except Exception as e:
                 print(f"[WARN] Skipping {file}: {e}")
     return companies
+def list_industries_and_companies(base_dir="data/raw/by_industry_sp500"):
+    industries = {}
+    if not os.path.exists(base_dir):
+        return industries
 
+    for industry in sorted(os.listdir(base_dir)):
+        industry_path = os.path.join(base_dir, industry)
+        if not os.path.isdir(industry_path):
+            continue
+
+        companies = {}
+        for file in sorted(os.listdir(industry_path)):
+            if file.endswith(".json"):
+                fp = os.path.join(industry_path, file)
+                try:
+                    with open(fp, "r") as f:
+                        data = json.load(f)
+                    name = data.get("entityName", file.replace(".json", ""))
+                    cik = str(data.get("cik", file.replace(".json", "")))
+                    companies[f"{name} ({cik})"] = fp
+                except Exception as e:
+                    print(f"[WARN] Could not load {file}: {e}")
+
+        industries[industry] = companies
+
+    return industries
 
 def load_company_json(file_path: str):
     if os.path.exists(file_path):
@@ -246,16 +307,39 @@ except Exception as e:
 st.divider()
 
 # ---------- Company selection ----------
-local_companies = list_local_companies()
-company_choice = st.selectbox(
-    "Select a company (from data/raw/Companies_urgent):",
-    ["-- Select --"] + list(local_companies.keys()),
+# ---------- Company selection with Industry ----------
+industries = list_industries_and_companies()
+completed = get_completed_companies()
+
+for ind in industries:
+    industries[ind] = {
+        name: fp for name, fp in industries[ind].items()
+        if name.split("(")[-1].strip(")") not in completed
+    }
+
+industry_choice = st.selectbox(
+    "Select Industry:",
+    ["-- Select --"] + list(industries.keys()),
     index=0
 )
 
 company_data = None
-if company_choice != "-- Select --":
-    company_data = load_company_json(local_companies[company_choice])
+company_choice = None
+company_file_path = None
+
+if industry_choice != "-- Select --":
+    all_companies = industries[industry_choice]
+
+    company_choice = st.selectbox(
+        "Select Company:",
+        ["-- Select --"] + list(all_companies.keys()),
+        index=0
+    )
+
+    if company_choice != "-- Select --":
+        company_file_path = all_companies[company_choice]
+        with open(company_file_path, "r") as f:
+            company_data = json.load(f)
 
 uploaded_json = st.file_uploader("Or upload your own company_facts.json", type="json")
 if uploaded_json:
@@ -411,6 +495,16 @@ else:
 
 st.divider()
 st.subheader("Export Company Mappings to JSON")
+# Mark company as completed
+if company_data and company_choice and industry_choice != "-- Select --":
+    if st.button("Mark Company as Completed"):
+        mark_company_completed(
+            cik=str(company_data.get("cik", "")),
+            name=company_data.get("entityName", ""),
+            industry=industry_choice
+        )
+        st.success("Company marked as completed.")
+        st.rerun()
 
 if company_data:
     if st.button("Download JSON Mappings"):
