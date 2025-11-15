@@ -277,9 +277,10 @@ try:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT company_name, cik, statement_type, COUNT(DISTINCT us_gaap_tag)
-        FROM term_mappings
-        GROUP BY company_name, cik, statement_type
+    SELECT company_name, cik, statement_type, COUNT(DISTINCT us_gaap_tag)
+    FROM term_mappings
+    WHERE cik NOT IN (SELECT cik FROM completed_companies)
+    GROUP BY company_name, cik, statement_type
     """)
     rows = cur.fetchall()
     conn.close()
