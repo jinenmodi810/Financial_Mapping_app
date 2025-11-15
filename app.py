@@ -36,25 +36,41 @@ def get_connection():
 
 st.set_page_config(page_title="Financial Term Mapper", layout="wide")
 
+# session key used when user clicks "Open" on dashboard
+if "selected_company_cik" not in st.session_state:
+    st.session_state["selected_company_cik"] = None
+
 
 def inject_mobile_styles():
     st.markdown("""
     <style>
-    .block-container {padding: 1rem !important;}
-    div[data-baseweb="select"] > div {min-height: 48px !important;}
-    button[kind="primary"] {min-height: 48px !important; font-size: 16px !important;}
+    .block-container {padding: 0.75rem 0.75rem 2.5rem 0.75rem !important;}
+
+    div[data-baseweb="select"] > div {
+        min-height: 44px !important;
+    }
+    button[kind="primary"], button[kind="secondary"] {
+        min-height: 44px !important;
+        font-size: 15px !important;
+        padding: 0.35rem 0.9rem !important;
+    }
+
     @media (max-width: 768px) {
         .stMarkdown, .stText, .stSelectbox, .stButton > button {
-            font-size: 15px !important;
+            font-size: 14px !important;
             line-height: 1.4em;
         }
-        table {font-size: 13px !important;}
+        table {font-size: 12px !important;}
+        .progress-card {
+            padding: 8px 10px !important;
+        }
     }
     [data-testid="stDataFrameContainer"] {
         overflow-x: auto !important;
         -webkit-overflow-scrolling: touch;
     }
     #MainMenu, footer, header {visibility: hidden;}
+
     .progress-card {
         padding: 10px 14px;
         margin-bottom: 10px;
@@ -63,10 +79,22 @@ def inject_mobile_styles():
         border: 1px solid #ddd;
         box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
-    .badge {display:inline-block;padding:2px 8px;border-radius:8px;color:white;font-size:13px;margin-right:6px;}
-    .income{background:#4caf50;}.balance{background:#2196f3;}
-    .cashflow{background:#ff9800;}.equity{background:#9c27b0;}
+    .badge {
+        display:inline-block;
+        padding:2px 8px;
+        border-radius:8px;
+        color:white;
+        font-size:13px;
+        margin-right:6px;
+        margin-top:4px;
+    }
+    .income{background:#4caf50;}
+    .balance{background:#2196f3;}
+    .cashflow{background:#ff9800;}
+    .equity{background:#9c27b0;}
     .total{background:#212121;}
+    .status-done{color:#2e7d32;font-weight:bold;padding-left:6px;}
+    .status-pending{color:#757575;font-weight:normal;padding-left:6px;}
     </style>
     """, unsafe_allow_html=True)
 
@@ -74,6 +102,9 @@ def inject_mobile_styles():
 inject_mobile_styles()
 st.title("Financial Term Mapper")
 st.caption("Extract SEC line items, view GAAP tags and descriptions, and map them to your own library.")
+
+
+# ------------------------- DB HELPERS -------------------------
 
 
 def fetch_saved_map(cik: str, statement_type: str) -> dict:
@@ -97,11 +128,12 @@ def fetch_saved_map(cik: str, statement_type: str) -> dict:
         for tag, lib in rows:
             if not tag:
                 continue
-            tag_norm = str(tag).strip().lower()  # temporary lowercase key for matching
+            tag_norm = str(tag).strip().lower()
             mapping[tag_norm] = str(lib).strip()
         return mapping
     finally:
         conn.close()
+
 
 def fetch_global_mappings() -> dict:
     """
@@ -129,6 +161,7 @@ def fetch_global_mappings() -> dict:
     finally:
         conn.close()
 
+
 def mark_company_completed(cik, name, industry):
     conn = get_connection()
     cur = conn.cursor()
@@ -143,27 +176,22 @@ def mark_company_completed(cik, name, industry):
 
 
 def get_completed_companies():
-    """
-    Return a set of CIKs that are already marked as completed.
-    If the completed_companies table does not exist yet,
-    return an empty set so the app still runs.
-    """
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
+        conn = get_connection()
         try:
-            cur.execute("SELECT cik FROM completed_companies")
-            rows = cur.fetchall()
-            return {str(r[0]) for r in rows}
-        except mysql.connector.errors.ProgrammingError as e:
-            # 1146 = table does not exist
-            if getattr(e, "errno", None) == 1146:
-                return set()
-            raise
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT cik, company_name FROM completed_companies")
+                rows = cur.fetchall()
+                return {str(cik): name for cik, name in rows}
+            except mysql.connector.errors.ProgrammingError as e:
+                if getattr(e, "errno", None) == 1146:
+                    return {}
+                raise
+            finally:
+                cur.close()
         finally:
-            cur.close()
-    finally:
-        conn.close()
+            conn.close()
+        
 
 def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_df, old_df):
     """Batch update and delete mappings based on full table diff."""
@@ -218,6 +246,9 @@ def upsert_mappings_batch(cik: str, company_name: str, statement_type: str, new_
         conn.close()
 
 
+# ------------------------- FILE HELPERS -------------------------
+
+
 @st.cache_data
 def list_local_companies():
     base_path = os.path.join("data", "raw", "Companies_urgent")
@@ -237,6 +268,9 @@ def list_local_companies():
             except Exception as e:
                 print(f"[WARN] Skipping {file}: {e}")
     return companies
+
+
+@st.cache_data
 def list_industries_and_companies(base_dir="data/raw/by_industry_sp500"):
     industries = {}
     if not os.path.exists(base_dir):
@@ -264,6 +298,7 @@ def list_industries_and_companies(base_dir="data/raw/by_industry_sp500"):
 
     return industries
 
+
 def load_company_json(file_path: str):
     if os.path.exists(file_path):
         with open(file_path, "r") as f:
@@ -271,57 +306,196 @@ def load_company_json(file_path: str):
     return None
 
 
-# ---------- Progress dashboard ----------
+# ------------------------- DASHBOARD -------------------------
+
+# ------------------------- ENTERPRISE DASHBOARD (Version D) -------------------------
+
 st.subheader("Company Mapping Progress Overview")
+
+# Search Bar
+search_query = st.text_input(
+    "Search companies:",
+    placeholder="Search by company name or CIK"
+).strip().lower()
+
+# Tabs
+tab_pending, tab_completed, tab_all = st.tabs(["Pending", "Completed", "All Companies"])
+
+completed = get_completed_companies()
+
+# Fetch all company statistics once (performance improvement)
 try:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-    SELECT company_name, cik, statement_type, COUNT(DISTINCT us_gaap_tag)
-    FROM term_mappings
-    WHERE cik NOT IN (SELECT cik FROM completed_companies)
-    GROUP BY company_name, cik, statement_type
+        SELECT company_name, cik, statement_type, COUNT(DISTINCT us_gaap_tag)
+        FROM term_mappings
+        GROUP BY company_name, cik, statement_type
+        ORDER BY company_name
     """)
     rows = cur.fetchall()
     conn.close()
-    if rows:
-        summary = {}
-        for name, cik, stype, count in rows:
-            summary.setdefault((name, cik), {})[stype] = count
-        for (name, cik), stats in summary.items():
-            total = sum(stats.values())
-            st.markdown(f"""
-            <div class='progress-card'>
-                <b>{name} ({cik})</b><br>
-                <span class='badge income'>Income: {stats.get('income', 0)}</span>
-                <span class='badge balance'>Balance: {stats.get('balance', 0)}</span>
-                <span class='badge cashflow'>Cashflow: {stats.get('cashflow', 0)}</span>
-                <span class='badge equity'>Equity: {stats.get('equity', 0)}</span>
-                <span class='badge total'>Total: {total}</span>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.info("No mappings saved yet. Start mapping to see progress here.")
+
+    # Build summary
+    summary = {}
+    for name, cik, stype, count in rows:
+        cik = str(cik)
+        if (name, cik) not in summary:
+            summary[(name, cik)] = {}
+        summary[(name, cik)][stype] = count
+
 except Exception as e:
     st.warning(f"Could not load dashboard: {e}")
+    summary = {}
+
+# Convert to list for easier filtering
+company_list = []
+for (name, cik), stats in summary.items():
+    total = sum(stats.values())
+    status = "DONE" if cik in completed else "PENDING"
+    company_list.append({
+        "name": name,
+        "cik": cik,
+        "income": stats.get("income", 0),
+        "balance": stats.get("balance", 0),
+        "cashflow": stats.get("cashflow", 0),
+        "equity": stats.get("equity", 0),
+        "total": total,
+        "status": status
+    })
+
+
+# ---------- Helper: Filtering ----------
+def apply_search(data):
+    if not search_query:
+        return data
+    return [
+        row for row in data
+        if search_query in row["name"].lower() or search_query in row["cik"]
+    ]
+
+
+# ---------- Helper: Pagination ----------
+def paginated_view(data, tab_container):
+    items_per_page = 10
+    total_pages = max(1, (len(data) + items_per_page - 1) // items_per_page)
+
+    if f"page_{tab_container}" not in st.session_state:
+        st.session_state[f"page_{tab_container}"] = 1
+
+    page = st.session_state[f"page_{tab_container}"]
+
+    col_prev, col_page, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if st.button("← Prev", key=f"prev_{tab_container}", disabled=(page == 1)):
+            st.session_state[f"page_{tab_container}"] = page - 1
+            st.rerun()
+
+    with col_page:
+        st.write(f"Page {page} of {total_pages}")
+
+    with col_next:
+        if st.button("Next →", key=f"next_{tab_container}", disabled=(page == total_pages)):
+            st.session_state[f"page_{tab_container}"] = page + 1
+            st.rerun()
+
+    start = (page - 1) * items_per_page
+    end = start + items_per_page
+    return data[start:end]
+
+
+# ---------- Render Cards ----------
+def render_company_cards(data, tab_id):
+    for global_index, row in enumerate(data):
+        name, cik = row["name"], row["cik"]
+
+        status_html = (
+            f"<span class='status-done'>DONE</span>"
+            if row["status"] == "DONE"
+            else f"<span class='status-pending'>PENDING</span>"
+        )
+
+        col_card, col_btn = st.columns([5, 1])
+
+        with col_card:
+            st.markdown(f"""
+                <div class='progress-card'>
+                    <b>{name} ({cik})</b> {status_html}<br>
+                    <span class='badge income'>Income: {row['income']}</span>
+                    <span class='badge balance'>Balance: {row['balance']}</span>
+                    <span class='badge cashflow'>Cashflow: {row['cashflow']}</span>
+                    <span class='badge equity'>Equity: {row['equity']}</span>
+                    <span class='badge total'>Total: {row['total']}</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+        with col_btn:
+            unique_key = f"open_{cik}_{tab_id}_{global_index}"
+            if st.button("Open", key=unique_key):
+                st.session_state["selected_company_cik"] = cik
+                st.rerun()
+
+
+# ------------------------- TAB 1 — PENDING -------------------------
+with tab_pending:
+    pending_companies = [c for c in company_list if c["status"] == "PENDING"]
+    pending_companies = apply_search(pending_companies)
+    paginated = paginated_view(pending_companies, "pend")
+    render_company_cards(paginated, "pending")
+
+# ------------------------- TAB 2 — COMPLETED -------------------------
+with tab_completed:
+    completed_companies = [c for c in company_list if c["status"] == "DONE"]
+    completed_companies = apply_search(completed_companies)
+    paginated = paginated_view(completed_companies, "comp")
+    render_company_cards(paginated, "completed")
+
+# ------------------------- TAB 3 — ALL COMPANIES -------------------------
+with tab_all:
+    all_filtered = apply_search(company_list)
+    paginated = paginated_view(all_filtered, "all")
+    render_company_cards(paginated, "all")
+# Completed companies list
+st.subheader("Completed Companies")
+if completed:
+    for cik in sorted(completed):
+        for cik, name in completed.items():
+            st.markdown(f"- **{name} ({cik})**")
+else:
+    st.info("No companies completed yet.")
 
 st.divider()
 
-# ---------- Company selection ----------
-# ---------- Company selection with Industry ----------
-industries = list_industries_and_companies()
-completed = get_completed_companies()
+# ------------------------- COMPANY SELECTION -------------------------
 
-for ind in industries:
-    industries[ind] = {
-        name: fp for name, fp in industries[ind].items()
-        if name.split("(")[-1].strip(")") not in completed
-    }
+
+industries = list_industries_and_companies()
+
+# If user clicked "Open" above, try to auto-select matching industry / company
+auto_cik = st.session_state.get("selected_company_cik")
+auto_industry = None
+auto_company_name = None
+
+if auto_cik:
+    for ind, comps in industries.items():
+        for full_name in comps.keys():
+            cik_value = full_name.split("(")[-1].rstrip(")")
+            if str(cik_value) == str(auto_cik):
+                auto_industry = ind
+                auto_company_name = full_name
+                break
+        if auto_industry:
+            break
+
+industry_options = ["-- Select --"] + list(industries.keys())
+industry_index = 0
+if auto_industry and auto_industry in industries:
+    industry_index = industry_options.index(auto_industry)
 
 industry_choice = st.selectbox(
     "Select Industry:",
-    ["-- Select --"] + list(industries.keys()),
-    index=0
+    industry_options,
+    index=industry_index
 )
 
 company_data = None
@@ -330,23 +504,30 @@ company_file_path = None
 
 if industry_choice != "-- Select --":
     all_companies = industries[industry_choice]
+    company_options = ["-- Select --"] + list(all_companies.keys())
+
+    company_index = 0
+    if auto_company_name and auto_company_name in all_companies:
+        company_index = company_options.index(auto_company_name)
 
     company_choice = st.selectbox(
         "Select Company:",
-        ["-- Select --"] + list(all_companies.keys()),
-        index=0
+        company_options,
+        index=company_index
     )
 
     if company_choice != "-- Select --":
         company_file_path = all_companies[company_choice]
-        with open(company_file_path, "r") as f:
-            company_data = json.load(f)
+        company_data = load_company_json(company_file_path)
 
+# Manual upload still allowed (overrides dropdown)
 uploaded_json = st.file_uploader("Or upload your own company_facts.json", type="json")
 if uploaded_json:
     company_data = json.load(uploaded_json)
 
-# ---------- Main logic ----------
+# ------------------------- MAIN LOGIC -------------------------
+
+
 if company_data:
     cik = str(company_data.get("cik", ""))
     company_name = company_data.get("entityName", "Unknown")
@@ -385,30 +566,28 @@ if company_data:
             st.stop()
         if "Library Term" not in df.columns:
             df["Library Term"] = ""
+
         saved_map = fetch_saved_map(cik, statement_type=statement_choice)
-        # Load global mappings for all companies
         global_map = fetch_global_mappings()
 
-        # Temporary normalized key column
         df["_key"] = df["us-gaap Tag"].astype(str).str.strip()
-
-        # Apply global mapping only where library term is still empty
         df["Library Term"] = df.apply(
             lambda row: (
                 saved_map.get(row["_key"].lower(), "") or
                 global_map.get(row["_key"], "") or
                 row["Library Term"]
-        ),
+            ),
             axis=1
         )
-
         df = df.drop(columns=["_key"], errors="ignore")
+
         df["us-gaap Tag"] = df["us-gaap Tag"].astype(str).str.strip()
         if saved_map:
             df["_key"] = df["us-gaap Tag"].str.lower()
             df["Library Term"] = df["_key"].map(saved_map).fillna(df["Library Term"])
             df = df.drop(columns=["_key"], errors="ignore")
             st.info(f"Loaded {len(saved_map)} previously saved mappings for this statement.")
+
         st.session_state[session_key] = df.copy()
 
     working_df = st.session_state[session_key].copy().fillna("")
@@ -454,65 +633,40 @@ if company_data:
 
     st.session_state[f"edited_{session_key}"] = df_to_keep.copy()
 
-    message_box = st.empty()
-    col_save, col_reset = st.columns([1, 1])
-    with col_save:
+    # ---------- ACTION BUTTONS (ORDERED) ----------
+    st.divider()
+    st.subheader("Export Company Mappings to JSON")
+
+    btn_cols = st.columns(3)
+
+    with btn_cols[0]:
         if st.button("Save mappings to database"):
             df_final = st.session_state.get(f"edited_{session_key}", df_to_keep)
             old_df = st.session_state[session_key]
             upsert_mappings_batch(cik, company_name, statement_choice, df_final, old_df)
-            message_box.success(f"✅ Saved {len(df_final)} mappings successfully for {company_name} ({statement_choice}).")
-            st.session_state[session_key] = df_final.copy()
-            st.rerun()
+            st.success(f"Saved {len(df_final)} mappings successfully for {company_name} ({statement_choice}).")
 
-    with col_reset:
-        if st.button("Reset unsaved edits in table"):
-            with st.spinner("Resetting view..."):
-                df = build_statement_table(cik, company_data, statement_type=statement_choice)
-                if "Library Term" not in df.columns:
-                    df["Library Term"] = ""
-                saved_map = fetch_saved_map(cik, statement_choice)
-                
-                global_map = fetch_global_mappings()
+    with btn_cols[1]:
+        if st.button("Download JSON Mappings"):
+            json_data = export_mappings_to_json(cik)
+            st.download_button(
+                label="Click here to download JSON file",
+                data=json_data,
+                file_name=f"{company_name.replace(' ', '_')}_mappings.json",
+                mime="application/json"
+            )
 
-                df["_key"] = df["us-gaap Tag"].astype(str).str.strip()
-                df["Library Term"] = df.apply(
-                lambda row: (
-                    saved_map.get(row["_key"].lower(), "") or
-                    global_map.get(row["_key"], "") or
-                    row["Library Term"]
-                ),
-                    axis=1
+    with btn_cols[2]:
+        if company_choice and industry_choice != "-- Select --":
+            if st.button("Mark Company as Completed"):
+                mark_company_completed(
+                    cik=str(company_data.get("cik", "")),
+                    name=company_data.get("entityName", ""),
+                    industry=industry_choice
                 )
-                df = df.drop(columns=["_key"], errors="ignore")
-                if saved_map:
-                    df["_key"] = df["us-gaap Tag"].astype(str).str.strip().str.lower()
-                    df["Library Term"] = df["_key"].map(saved_map).fillna(df["Library Term"])
-                    df = df.drop(columns=["_key"], errors="ignore")
-                st.session_state[session_key] = df.copy()
-            st.rerun()
+                st.success("Company marked as completed.")
+                # keep selected so user can still edit later
+                st.rerun()
+
 else:
     st.info("Please select a company or upload a JSON file to begin.")
-
-st.divider()
-st.subheader("Export Company Mappings to JSON")
-# Mark company as completed
-if company_data and company_choice and industry_choice != "-- Select --":
-    if st.button("Mark Company as Completed"):
-        mark_company_completed(
-            cik=str(company_data.get("cik", "")),
-            name=company_data.get("entityName", ""),
-            industry=industry_choice
-        )
-        st.success("Company marked as completed.")
-        st.rerun()
-
-if company_data:
-    if st.button("Download JSON Mappings"):
-        json_data = export_mappings_to_json(cik)
-        st.download_button(
-            label="Click here to download JSON file",
-            data=json_data,
-            file_name=f"{company_name.replace(' ', '_')}_mappings.json",
-            mime="application/json"
-        )
